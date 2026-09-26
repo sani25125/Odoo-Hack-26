@@ -745,3 +745,199 @@ Do not introduce sharding, event-sourcing infrastructure, or microservices for t
 Column constraints reject impossible individual values. Unique constraints prevent duplicate identities and duplicate lines. Foreign keys preserve references. Transactions enforce atomic multi-table changes. Row locks protect concurrent validation. The operation service enforces status transitions and operation-type relationships.
 
 The database should be initialized with one warehouse and at least two active locations for the demo lifecycle.
+
+## 10. Normative Database Corrections
+
+This section overrides any earlier wording that describes a protection only in prose. The following rules are required in the actual PostgreSQL migration and transaction implementation.
+
+### 10.1 Required Database Constraints
+
+Create named constraints for:
+
+- Case-insensitive, trimmed, unique SKU.
+- Non-blank product, category, warehouse, location, supplier, and reason values.
+- Receipt, delivery, transfer, and opening quantities greater than zero.
+- Adjustment physical counts greater than or equal to zero.
+- Stock balance quantities greater than or equal to zero.
+- Ledger before and after quantities greater than or equal to zero.
+- Reorder thresholds greater than or equal to zero.
+- Transfer source and destination locations being different.
+- Allowed operation types, operation statuses, and ledger entry kinds.
+- Ledger quantity arithmetic:
+
+      quantity_after = quantity_before + quantity_delta
+
+The quantity restrictions must be database CHECK constraints, not only request validation.
+
+### 10.2 Explicit Foreign-Key Delete Behavior
+
+All foreign keys from historical records must explicitly use ON DELETE RESTRICT, including:
+
+- Product references from operation lines, stock balances, and stock ledger.
+- Location references from operation lines, stock balances, and stock ledger.
+- Operation references from type-specific headers, lines, and stock ledger.
+- User references from operations and stock ledger.
+- Category references from products.
+- Warehouse references from locations.
+
+Products, locations, warehouses, categories, users, operations, and completed history are not deleted through the MVP application. Master records are deactivated where applicable.
+
+The only intentional cascade is password_reset_tokens.user_id, because reset tokens have no historical audit value.
+
+### 10.3 Operation Type and Status Enforcement
+
+The operation status constraint must prevent preparation statuses on non-deliveries:
+
+- DELIVERY may use DRAFT, PICKED, PACKED, DONE, or CANCELED.
+- RECEIPT, TRANSFER, ADJUSTMENT, and OPENING may use DRAFT, DONE, or CANCELED.
+
+Status transitions are backend rules executed while the operation row is locked. The database may additionally enforce them with a trigger.
+
+Each operation type must have exactly its matching detail structure:
+
+- RECEIPT has one receipt header.
+- DELIVERY has one delivery header.
+- TRANSFER has one transfer header.
+- ADJUSTMENT has one adjustment header.
+- OPENING has opening lines.
+
+Ordinary foreign keys do not enforce this type relationship. The backend must enforce it, and a deferred constraint trigger is recommended if direct database writes must also be protected.
+
+### 10.4 Ledger Reference Integrity
+
+The stock ledger must contain exactly one originating line reference:
+
+- receipt_line_id
+- delivery_line_id
+- transfer_line_id
+- adjustment_line_id
+- opening_line_id
+
+The migration must create a CHECK constraint requiring the number of non-null references to equal one.
+
+The entry kind must match the reference:
+
+- RECEIPT references receipt_lines.
+- DELIVERY references delivery_lines.
+- TRANSFER_OUT and TRANSFER_IN reference transfer_lines.
+- ADJUSTMENT references adjustment_lines.
+- OPENING references opening_stock_lines.
+
+This cross-table rule must be enforced by the backend transaction and should be protected by a deferred constraint trigger.
+
+### 10.5 Idempotency Key
+
+The idempotency rule must not rely only on operation_id, entry_kind, product_id, and location_id. The originating line identity must be included so legitimate distinct lines cannot collide.
+
+Use a unique expression index based on:
+
+      operation_id
+      entry_kind
+      originating_line_id
+
+where originating_line_id is the one non-null line reference. For transfers, TRANSFER_OUT and TRANSFER_IN remain distinct entry kinds.
+
+The operation row must be locked before the status is checked. If it is already DONE, validation returns without changing stock or inserting ledger entries.
+
+### 10.6 Safe Concurrent Stock Access
+
+The validation transaction must:
+
+1. Lock the operation row.
+2. Ensure every affected stock_balances row exists.
+3. Lock every affected stock_balances row.
+4. Lock rows in deterministic product/location order.
+5. Re-check stock availability using the locked values.
+6. Apply all balances and ledger entries in the same transaction.
+
+If a stock balance row does not exist, the insert-or-lock sequence must prevent two concurrent requests from creating competing authoritative rows.
+
+### 10.7 Atomic Validation Boundary
+
+The following must be one PostgreSQL transaction:
+
+- Operation status check.
+- All line validation.
+- All stock balance locks.
+- All stock balance updates.
+- All ledger inserts.
+- Final operation status update to DONE.
+
+If any part fails, all parts roll back. A transaction covering only stock updates is insufficient.
+
+### 10.8 Adjustment Rules
+
+Adjustment physical counts may be zero. Movement quantities for receipts, deliveries, transfers, and opening stock may not be zero.
+
+For a completed adjustment:
+
+      stock_quantity_after = physical_counted_quantity
+      difference = physical_counted_quantity - recorded_quantity_before
+
+The backend transaction must populate and verify recorded_quantity_before, stock_quantity_after, and difference. A deferred constraint trigger may provide additional protection.
+
+Zero-difference adjustment ledger behavior remains a product decision. The schema permits a zero adjustment ledger entry for audit purposes.
+
+### 10.9 Stock and Ledger Reconciliation
+
+The database cannot enforce the relationship between stock_balances and stock_ledger with an ordinary CHECK constraint because it spans tables.
+
+The backend must update both in the same transaction. Provide a reconciliation query or administrative diagnostic that compares:
+
+      current stock balance
+      against
+      opening movements
+      + receipt movements
+      - delivery movements
+      + transfer movements
+      + adjustment differences
+
+### 10.10 Ledger Indexes and Pagination
+
+In addition to the existing indexes, create:
+
+- An index on created_at descending, id descending for global recent activity.
+- Product/location/time index for product history.
+- Operation/time index for operation drill-down.
+- Idempotency unique index using the originating line identity.
+
+Ledger and operation history must use keyset pagination based on created_at and id. Unbounded ledger queries are prohibited.
+
+### 10.11 Dashboard Query Rule
+
+Dashboard queries must read current quantities from stock_balances. They must not calculate current stock by scanning the entire stock_ledger.
+
+The dashboard service should use one endpoint and a small fixed set of indexed aggregate queries for:
+
+- Distinct products with stock records.
+- Total units across locations.
+- Low-stock and out-of-stock products.
+- Pending receipts, deliveries, and transfers.
+- Recent ledger activity.
+
+### 10.12 Responsibility Boundary
+
+Database constraints protect row-level invariants and identity. Backend transactions protect cross-row business rules:
+
+Database:
+
+- Foreign keys
+- Unique constraints
+- Quantity checks
+- Non-negative balances
+- Same-location rejection
+- Ledger arithmetic
+- Ledger reference cardinality
+
+Backend plus database transaction:
+
+- Delivery availability
+- Transfer availability
+- Operation status transitions
+- Operation type/detail consistency
+- Ledger entry kind consistency
+- Idempotent validation
+- Atomic multi-line completion
+- Stock/ledger synchronization
+
+These responsibilities must not be left as frontend-only behavior.
